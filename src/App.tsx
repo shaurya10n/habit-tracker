@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type CSSProperties,
 } from 'react'
 import {
   closestCenter,
@@ -145,6 +146,42 @@ function enumerateYMDInclusive(start: Date, end: Date): string[] {
     cur.setDate(cur.getDate() + 1)
   }
   return out
+}
+
+function ymdCompare(a: string, b: string): number {
+  if (a < b) return -1
+  if (a > b) return 1
+  return 0
+}
+
+/** First day of the calendar month `monthsAgo` months before `anchorYMD`. */
+function monthFirstYMD(anchorYMD: string, monthsAgo: number): string {
+  const d = parseYMD(anchorYMD)
+  d.setMonth(d.getMonth() - monthsAgo)
+  d.setDate(1)
+  return formatYMD(d)
+}
+
+/** Sunday on or before `d` (local). */
+function startOfWeekSunday(d: Date): Date {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  const dow = x.getDay()
+  x.setDate(x.getDate() - dow)
+  return x
+}
+
+/** Saturday on or after `d` (local). */
+function endOfWeekSaturday(d: Date): Date {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate())
+  const dow = x.getDay()
+  if (dow !== 6) x.setDate(x.getDate() + (6 - dow))
+  return x
+}
+
+function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex.trim())
+  if (!m) return null
+  return { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) }
 }
 
 type RateResult = { done: number; total: number; pct: number }
@@ -690,6 +727,271 @@ function SortableHabitRow({
   )
 }
 
+const HEATMAP_ACCENT_DEFAULT = '#22c55e'
+
+function dayOverallCompletion(
+  ymd: string,
+  habits: Habit[],
+  completions: Persisted['completions'],
+): { done: number; total: number; pct: number } {
+  const n = habits.length
+  if (n === 0) return { done: 0, total: 0, pct: 0 }
+  const map = completions[ymd]
+  let done = 0
+  for (const h of habits) {
+    if (map?.[h.id]) done++
+  }
+  return { done, total: n, pct: Math.round((done / n) * 100) }
+}
+
+type HeatmapStatsViewProps = {
+  habits: Habit[]
+  completions: Persisted['completions']
+  todayYMD: string
+}
+
+function HeatmapStatsView({
+  habits,
+  completions,
+  todayYMD,
+}: HeatmapStatsViewProps) {
+  const [focusHabitId, setFocusHabitId] = useState('')
+
+  const rangeStartYMD = useMemo(() => monthFirstYMD(todayYMD, 2), [todayYMD])
+
+  const columns = useMemo(() => {
+    const rangeStart = parseYMD(rangeStartYMD)
+    const rangeEnd = parseYMD(todayYMD)
+    const gridStart = startOfWeekSunday(rangeStart)
+    const gridEnd = endOfWeekSaturday(rangeEnd)
+    const cols: { ymd: string; inRange: boolean }[][] = []
+    const weekStart = new Date(gridStart)
+    while (weekStart <= gridEnd) {
+      const col: { ymd: string; inRange: boolean }[] = []
+      for (let i = 0; i < 7; i++) {
+        const d = new Date(weekStart)
+        d.setDate(weekStart.getDate() + i)
+        const ymd = formatYMD(d)
+        const inRange =
+          ymdCompare(ymd, rangeStartYMD) >= 0 && ymdCompare(ymd, todayYMD) <= 0
+        col.push({ ymd, inRange })
+      }
+      cols.push(col)
+      weekStart.setDate(weekStart.getDate() + 7)
+    }
+    return cols
+  }, [todayYMD, rangeStartYMD])
+
+  const focusHabit = habits.find((h) => h.id === focusHabitId)
+  const accentHex = focusHabit?.color ?? HEATMAP_ACCENT_DEFAULT
+  const rgb = hexToRgb(accentHex) ?? { r: 34, g: 197, b: 94 }
+
+  const monthLabelForColumn = (col: { ymd: string; inRange: boolean }[]) => {
+    for (const cell of col) {
+      if (!cell.inRange) continue
+      const d = parseYMD(cell.ymd)
+      if (d.getDate() === 1) {
+        return d.toLocaleDateString(undefined, { month: 'short' })
+      }
+    }
+    return ''
+  }
+
+  const cellStyle = (
+    inRange: boolean,
+    pct: number,
+  ): CSSProperties => {
+    if (!inRange) {
+      return {
+        backgroundColor: 'rgba(39, 39, 42, 0.35)',
+        border: '1px solid rgba(63, 63, 70, 0.5)',
+      }
+    }
+    if (habits.length === 0) {
+      return {
+        backgroundColor: 'rgba(39, 39, 42, 0.5)',
+        border: '1px solid rgba(63, 63, 70, 0.6)',
+      }
+    }
+    if (pct <= 0) {
+      return {
+        backgroundColor: 'transparent',
+        border: '1px solid rgba(63, 63, 70, 0.85)',
+      }
+    }
+    const alpha = 0.12 + (pct / 100) * 0.88
+    return {
+      backgroundColor: `rgba(${rgb.r},${rgb.g},${rgb.b},${alpha})`,
+      border: `1px solid rgba(${rgb.r},${rgb.g},${rgb.b},${0.35 + (pct / 100) * 0.45})`,
+    }
+  }
+
+  const weekDayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+
+  return (
+    <div className="flex flex-col gap-5">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">
+          Stats
+        </h1>
+        <p className="mt-1 text-sm text-zinc-500">
+          Last 3 calendar months — daily completion from your saved history.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end sm:justify-between">
+        <div className="flex flex-wrap gap-2">
+          <span className="self-center text-xs font-medium uppercase tracking-wider text-zinc-500">
+            View
+          </span>
+          <button
+            type="button"
+            onClick={() => setFocusHabitId('')}
+            className={[
+              'rounded-lg px-3 py-1.5 text-xs font-medium transition-colors',
+              focusHabitId === ''
+                ? 'bg-emerald-600/25 text-emerald-200 ring-1 ring-emerald-500/40'
+                : 'border border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200',
+            ].join(' ')}
+          >
+            All habits
+          </button>
+        </div>
+        <label className="flex min-w-0 flex-col gap-1 sm:max-w-xs">
+          <span className="text-xs font-medium uppercase tracking-wider text-zinc-500">
+            Per habit
+          </span>
+          <select
+            value={focusHabitId}
+            onChange={(e) => setFocusHabitId(e.target.value)}
+            className="min-h-10 rounded-lg border border-zinc-700 bg-zinc-900 px-3 text-sm text-zinc-100 outline-none focus:border-emerald-600/70 focus:ring-2 focus:ring-emerald-500/30"
+          >
+            <option value="">— Overall —</option>
+            {habits.map((h) => (
+              <option key={h.id} value={h.id}>
+                {h.icon} {h.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {focusHabitId && focusHabit && (
+        <p className="text-xs text-zinc-500">
+          Showing <span className="text-zinc-300">{focusHabit.icon}</span>{' '}
+          <span className="font-medium text-zinc-300">{focusHabit.name}</span>{' '}
+          (done vs not per day).
+        </p>
+      )}
+
+      <div className="overflow-x-auto rounded-xl border border-zinc-800/90 bg-zinc-900/40 p-3">
+        <div
+          className="flex min-w-min gap-1"
+          role="grid"
+          aria-label="Completion heatmap, last three months"
+        >
+          <div
+            className="flex flex-col justify-end gap-[3px] pr-1 pt-5 text-[10px] text-zinc-600"
+            aria-hidden
+          >
+            {weekDayLabels.map((d) => (
+              <div
+                key={d}
+                className="flex h-[11px] items-center sm:h-[13px]"
+                style={{ lineHeight: 1 }}
+              >
+                {d[0]}
+              </div>
+            ))}
+          </div>
+          {columns.map((col, ci) => {
+            const ml = monthLabelForColumn(col)
+            return (
+              <div
+                key={ci}
+                className="flex flex-col gap-[3px]"
+                role="presentation"
+              >
+                <div className="h-4 text-[10px] leading-4 text-zinc-500">
+                  {ml || '\u00a0'}
+                </div>
+                {col.map((cell) => {
+                  let title: string
+                  let pct = 0
+                  let done = 0
+                  let total = habits.length
+                  const display = parseYMD(cell.ymd).toLocaleDateString(
+                    undefined,
+                    {
+                      weekday: 'short',
+                      month: 'short',
+                      day: 'numeric',
+                      year: 'numeric',
+                    },
+                  )
+                  if (!cell.inRange) {
+                    title = `${display} (outside range)`
+                  } else if (habits.length === 0) {
+                    title = `${display} — add habits to track`
+                  } else if (focusHabitId) {
+                    const ok = !!completions[cell.ymd]?.[focusHabitId]
+                    pct = ok ? 100 : 0
+                    done = ok ? 1 : 0
+                    total = 1
+                    title = `${display} — ${ok ? 'Completed' : 'Not completed'} (1 habit)`
+                  } else {
+                    const o = dayOverallCompletion(
+                      cell.ymd,
+                      habits,
+                      completions,
+                    )
+                    done = o.done
+                    total = o.total
+                    pct = o.pct
+                    title = `${display} — ${done}/${total} habits (${pct}%)`
+                  }
+                  return (
+                    <div
+                      key={cell.ymd}
+                      role="gridcell"
+                      title={title}
+                      style={{
+                        ...cellStyle(cell.inRange, pct),
+                        width: 11,
+                        height: 11,
+                        borderRadius: 2,
+                      }}
+                      className="shrink-0 cursor-default sm:h-[13px] sm:w-[13px]"
+                    />
+                  )
+                })}
+              </div>
+            )
+          })}
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+          <span>Less</span>
+          <div className="flex gap-0.5">
+            {[0, 0.2, 0.4, 0.6, 0.8, 1].map((t) => (
+              <div
+                key={t}
+                className="h-2.5 w-2.5 rounded-sm border border-zinc-700"
+                style={{
+                  backgroundColor:
+                    t === 0
+                      ? 'transparent'
+                      : `rgba(${rgb.r},${rgb.g},${rgb.b},${0.12 + t * 0.88})`,
+                }}
+              />
+            ))}
+          </div>
+          <span>More</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function App() {
   const [data, setData] = useState<AppData>(() => {
     const p = loadPersisted()
@@ -721,6 +1023,7 @@ export default function App() {
   })
   const [newCategoryInput, setNewCategoryInput] = useState('')
   const [logView, setLogView] = useState<'today' | 'yesterday'>('today')
+  const [appTab, setAppTab] = useState<'track' | 'stats'>('track')
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const milestoneToastDedupeRef = useRef(new Set<string>())
   const pendingMilestonesRef = useRef<{ name: string; m: number }[]>([])
@@ -1140,6 +1443,44 @@ export default function App() {
       </div>
 
       <div className="mx-auto flex min-h-dvh max-w-lg flex-col px-4 pb-10 pt-8 sm:px-6 sm:pt-12">
+        <nav
+          className="mb-6 flex gap-1 rounded-xl border border-zinc-800 bg-zinc-900/50 p-1"
+          aria-label="Main navigation"
+        >
+          <button
+            type="button"
+            onClick={() => setAppTab('track')}
+            className={[
+              'min-h-10 flex-1 rounded-lg px-3 text-sm font-medium transition-colors',
+              appTab === 'track'
+                ? 'bg-zinc-100 text-zinc-900 shadow-sm'
+                : 'text-zinc-400 hover:bg-zinc-800/80 hover:text-zinc-200',
+            ].join(' ')}
+          >
+            Track
+          </button>
+          <button
+            type="button"
+            onClick={() => setAppTab('stats')}
+            className={[
+              'min-h-10 flex-1 rounded-lg px-3 text-sm font-medium transition-colors',
+              appTab === 'stats'
+                ? 'bg-zinc-100 text-zinc-900 shadow-sm'
+                : 'text-zinc-400 hover:bg-zinc-800/80 hover:text-zinc-200',
+            ].join(' ')}
+          >
+            Stats
+          </button>
+        </nav>
+
+        {appTab === 'stats' ? (
+          <HeatmapStatsView
+            habits={habits}
+            completions={completions}
+            todayYMD={today}
+          />
+        ) : (
+          <>
         <header className="mb-8 space-y-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0 space-y-1">
@@ -1225,7 +1566,7 @@ export default function App() {
 
           <div className="mt-5 border-t border-zinc-800/80 pt-4">
             <h2 className="mb-3 text-xs font-medium uppercase tracking-wider text-zinc-500">
-              Stats
+              Summary
             </h2>
             {total === 0 ? (
               <p className="text-sm text-zinc-500">
@@ -1389,6 +1730,9 @@ export default function App() {
             Add habit
           </button>
         </section>
+
+          </>
+        )}
 
         {habitModal && (
           <div
