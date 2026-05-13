@@ -517,7 +517,8 @@ type HabitDraft = {
 
 type SortableHabitRowProps = {
   habit: Habit
-  today: string
+  logDate: string
+  dragDisabled?: boolean
   completions: Persisted['completions']
   habitRates: Record<string, { week: RateResult; month: RateResult }>
   bestStreakByHabitId: Record<string, number>
@@ -528,7 +529,8 @@ type SortableHabitRowProps = {
 
 function SortableHabitRow({
   habit,
-  today,
+  logDate,
+  dragDisabled = false,
   completions,
   habitRates,
   bestStreakByHabitId,
@@ -543,7 +545,7 @@ function SortableHabitRow({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id: habit.id })
+  } = useSortable({ id: habit.id, disabled: dragDisabled })
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -551,7 +553,7 @@ function SortableHabitRow({
     zIndex: isDragging ? 1 : undefined,
   }
 
-  const done = isCompleted(completions, habit.id, today)
+  const done = isCompleted(completions, habit.id, logDate)
   const streak = habitStreak(completions, habit.id)
   const best = bestStreakByHabitId[habit.id] ?? 0
   const showStreakRow = streak > 0 || best > 0
@@ -560,6 +562,7 @@ function SortableHabitRow({
   return (
     <li
       ref={setNodeRef}
+      {...(dragDisabled ? attributes : {})}
       style={{
         ...style,
         borderLeft: `3px solid ${habit.color}`,
@@ -570,10 +573,18 @@ function SortableHabitRow({
     >
       <button
         type="button"
-        className="flex w-8 shrink-0 cursor-grab touch-none items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 active:cursor-grabbing"
-        aria-label={`Reorder ${habit.name}`}
-        {...attributes}
-        {...listeners}
+        disabled={dragDisabled}
+        className={[
+          'flex w-8 shrink-0 touch-none items-center justify-center rounded-lg text-zinc-500',
+          dragDisabled
+            ? 'cursor-default opacity-40'
+            : 'cursor-grab hover:bg-zinc-800 hover:text-zinc-300 active:cursor-grabbing',
+        ].join(' ')}
+        aria-label={
+          dragDisabled ? `Reorder unavailable` : `Reorder ${habit.name}`
+        }
+        {...(dragDisabled ? {} : attributes)}
+        {...(dragDisabled ? {} : listeners)}
       >
         <svg
           className="h-5 w-5"
@@ -709,12 +720,19 @@ export default function App() {
     icon: EMOJI_ICONS[0],
   })
   const [newCategoryInput, setNewCategoryInput] = useState('')
+  const [logView, setLogView] = useState<'today' | 'yesterday'>('today')
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const milestoneToastDedupeRef = useRef(new Set<string>())
   const pendingMilestonesRef = useRef<{ name: string; m: number }[]>([])
 
   const now = new Date()
   const today = formatYMD(now)
+  const yesterdayYMD = useMemo(() => {
+    const d = parseYMD(today)
+    d.setDate(d.getDate() - 1)
+    return formatYMD(d)
+  }, [today])
+  const activeLogDate = logView === 'yesterday' ? yesterdayYMD : today
 
   useEffect(() => {
     savePersisted({
@@ -828,10 +846,10 @@ export default function App() {
     })
   }, [habits, completions])
 
-  const completedToday = useMemo(() => {
-    const day = completions[today] ?? {}
+  const completedForActiveDate = useMemo(() => {
+    const day = completions[activeLogDate] ?? {}
     return habits.filter((h) => day[h.id]).length
-  }, [habits, completions, today])
+  }, [habits, completions, activeLogDate])
 
   const { weekDates, monthDates, weekOverall, monthOverall, habitRates } =
     useMemo(() => {
@@ -896,14 +914,15 @@ export default function App() {
   }, [habits, habitOrderByCategory])
 
   const total = habits.length
-  const allDone = total > 0 && completedToday === total
-  const progressPct = total === 0 ? 0 : Math.round((completedToday / total) * 100)
+  const allDone = total > 0 && completedForActiveDate === total
+  const progressPct =
+    total === 0 ? 0 : Math.round((completedForActiveDate / total) * 100)
 
   const toggle = useCallback(
     (habitId: string) => {
       setData((s) => {
         const next: Persisted['completions'] = { ...s.completions }
-        const day = { ...(next[today] ?? {}) }
+        const day = { ...(next[activeLogDate] ?? {}) }
         if (day[habitId]) {
           delete day[habitId]
         } else {
@@ -912,14 +931,14 @@ export default function App() {
         let nextCompletions: Persisted['completions']
         if (Object.keys(day).length === 0) {
           nextCompletions = { ...next }
-          delete nextCompletions[today]
+          delete nextCompletions[activeLogDate]
         } else {
-          nextCompletions = { ...next, [today]: day }
+          nextCompletions = { ...next, [activeLogDate]: day }
         }
         return { ...s, completions: nextCompletions }
       })
     },
-    [today],
+    [activeLogDate],
   )
 
   const saveHabitModal = useCallback(() => {
@@ -1091,12 +1110,16 @@ export default function App() {
     return arr
   }, [categoryOptions, draft.category])
 
-  const dateLabel = now.toLocaleDateString(undefined, {
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  })
+  const headerDateLabel = useMemo(() => {
+    const d =
+      logView === 'yesterday' ? parseYMD(yesterdayYMD) : parseYMD(today)
+    return d.toLocaleDateString(undefined, {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    })
+  }, [logView, yesterdayYMD, today])
 
   return (
     <div className="min-h-dvh bg-zinc-950 text-zinc-100 antialiased">
@@ -1117,13 +1140,42 @@ export default function App() {
       </div>
 
       <div className="mx-auto flex min-h-dvh max-w-lg flex-col px-4 pb-10 pt-8 sm:px-6 sm:pt-12">
-        <header className="mb-8 space-y-1">
-          <p className="text-sm font-medium tracking-wide text-zinc-500">
-            {dateLabel}
-          </p>
-          <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">
-            Today
-          </h1>
+        <header className="mb-8 space-y-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 space-y-1">
+              <p className="text-sm font-medium tracking-wide text-zinc-500">
+                {headerDateLabel}
+              </p>
+              <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">
+                {logView === 'yesterday' ? 'Yesterday' : 'Today'}
+              </h1>
+            </div>
+            <div className="flex shrink-0 flex-col items-end gap-2 sm:flex-row sm:items-center">
+              {logView === 'today' ? (
+                <button
+                  type="button"
+                  onClick={() => setLogView('yesterday')}
+                  className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-zinc-600 hover:bg-zinc-800 hover:text-white"
+                >
+                  Log Yesterday
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setLogView('today')}
+                  className="rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:border-zinc-600 hover:bg-zinc-800 hover:text-white"
+                >
+                  Back to today
+                </button>
+              )}
+            </div>
+          </div>
+          {logView === 'yesterday' && (
+            <p className="text-xs text-zinc-500">
+              Catch up on yesterday only — older dates stay read-only in this
+              app.
+            </p>
+          )}
         </header>
 
         <section
@@ -1137,11 +1189,15 @@ export default function App() {
               ) : (
                 <>
                   <span className="font-medium text-zinc-200">
-                    {completedToday}
+                    {completedForActiveDate}
                   </span>
                   <span className="text-zinc-500"> of </span>
                   <span className="font-medium text-zinc-200">{total}</span>
-                  <span className="text-zinc-500"> habits completed today</span>
+                  <span className="text-zinc-500">
+                    {' '}
+                    habits completed{' '}
+                    {logView === 'yesterday' ? 'yesterday' : 'today'}
+                  </span>
                 </>
               )}
             </span>
@@ -1152,10 +1208,14 @@ export default function App() {
           <div
             className="h-2.5 overflow-hidden rounded-full bg-zinc-800"
             role="progressbar"
-            aria-valuenow={completedToday}
+            aria-valuenow={completedForActiveDate}
             aria-valuemin={0}
             aria-valuemax={total}
-            aria-label="Habits completed today"
+            aria-label={
+              logView === 'yesterday'
+                ? 'Habits completed yesterday'
+                : 'Habits completed today'
+            }
           >
             <div
               className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-500 ease-out"
@@ -1257,10 +1317,14 @@ export default function App() {
         {allDone && (
           <div className="animate-habit-done mb-6 overflow-hidden rounded-2xl border border-emerald-500/30 bg-emerald-950/40 px-4 py-4 text-center">
             <p className="text-lg font-semibold text-emerald-200">
-              All done for today
+              {logView === 'yesterday'
+                ? 'All done for yesterday'
+                : 'All done for today'}
             </p>
             <p className="mt-1 text-sm text-emerald-400/90">
-              Nice work — see you tomorrow.
+              {logView === 'yesterday'
+                ? 'Nice — your streaks are updated.'
+                : 'Nice work — see you tomorrow.'}
             </p>
           </div>
         )}
@@ -1298,7 +1362,8 @@ export default function App() {
                         <SortableHabitRow
                           key={habit.id}
                           habit={habit}
-                          today={today}
+                          logDate={activeLogDate}
+                          dragDisabled={logView === 'yesterday'}
                           completions={completions}
                           habitRates={habitRates}
                           bestStreakByHabitId={bestStreakByHabitId}
