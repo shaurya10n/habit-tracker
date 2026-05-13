@@ -5,6 +5,23 @@ import {
   useRef,
   useState,
 } from 'react'
+import {
+  closestCenter,
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core'
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 
 const STORAGE_KEY = 'habit-tracker-v1'
 const STREAK_MILESTONES = [7, 30, 100] as const
@@ -77,8 +94,11 @@ type Habit = {
   icon: string
 }
 
+/** category name → ordered habit ids within that category */
+type HabitOrderMap = Record<string, string[]>
+
 type Persisted = {
-  version: 3
+  version: 4
   habits: Habit[]
   /** YYYY-MM-DD → habitId → completed */
   completions: Record<string, Record<string, true>>
@@ -87,6 +107,7 @@ type Persisted = {
   milestoneSeen: Record<string, Record<string, true>>
   /** User-defined category labels (not in presets) */
   customCategories: string[]
+  habitOrderByCategory: HabitOrderMap
 }
 
 function formatYMD(d: Date): string {
@@ -209,6 +230,68 @@ function normalizeHabit(h: unknown, index: number): Habit | null {
   }
 }
 
+function mergeOrderWithHabits(
+  category: string,
+  habitsInCat: Habit[],
+  orderMap: HabitOrderMap,
+): Habit[] {
+  const ids = orderMap[category] ?? []
+  const byId = new Map(habitsInCat.map((h) => [h.id, h]))
+  const inCat = new Set(habitsInCat.map((h) => h.id))
+  const seen = new Set<string>()
+  const out: Habit[] = []
+  for (const id of ids) {
+    if (!inCat.has(id)) continue
+    const h = byId.get(id)
+    if (h) {
+      out.push(h)
+      seen.add(id)
+    }
+  }
+  for (const h of habitsInCat) {
+    if (!seen.has(h.id)) out.push(h)
+  }
+  return out
+}
+
+function sanitizeHabitOrderMap(
+  habits: Habit[],
+  orderMap: HabitOrderMap,
+): HabitOrderMap {
+  const byCat = new Map<string, Habit[]>()
+  for (const h of habits) {
+    const c = h.category?.trim() || 'Other'
+    if (!byCat.has(c)) byCat.set(c, [])
+    byCat.get(c)!.push(h)
+  }
+  const out: HabitOrderMap = {}
+  for (const [cat, list] of byCat) {
+    const known = new Set(list.map((h) => h.id))
+    const prev = orderMap[cat] ?? []
+    const next: string[] = []
+    const used = new Set<string>()
+    for (const id of prev) {
+      if (known.has(id) && !used.has(id)) {
+        next.push(id)
+        used.add(id)
+      }
+    }
+    for (const h of list) {
+      if (!used.has(h.id)) next.push(h.id)
+    }
+    out[cat] = next
+  }
+  return out
+}
+
+function findCategoryForHabitId(
+  habits: Habit[],
+  habitId: string,
+): string | null {
+  const h = habits.find((x) => x.id === habitId)
+  return h ? (h.category?.trim() || 'Other') : null
+}
+
 function mergeCustomCategories(
   stored: string[] | undefined,
   habits: Habit[],
@@ -272,12 +355,13 @@ function backfillStreakFields(
 
 function loadPersisted(): Persisted {
   const empty = (): Persisted => ({
-    version: 3,
+    version: 4,
     habits: defaultHabits(),
     completions: {},
     bestStreakByHabitId: {},
     milestoneSeen: {},
     customCategories: [],
+    habitOrderByCategory: {},
   })
 
   try {
@@ -307,7 +391,7 @@ function loadPersisted(): Persisted {
     let bestStreakByHabitId: Record<string, number> = {}
     let milestoneSeen: Record<string, Record<string, true>> = {}
 
-    if (ver !== 3) {
+    if (ver !== 4) {
       const bf = backfillStreakFields(normalizedHabits, completions)
       bestStreakByHabitId = bf.bestStreakByHabitId
       milestoneSeen = bf.milestoneSeen
@@ -347,13 +431,34 @@ function loadPersisted(): Persisted {
       : undefined
     const customCategories = mergeCustomCategories(storedCustom, normalizedHabits)
 
+    let habitOrderByCategory: HabitOrderMap = {}
+    if (
+      ver === 4 &&
+      rec.habitOrderByCategory &&
+      typeof rec.habitOrderByCategory === 'object'
+    ) {
+      for (const [k, v] of Object.entries(
+        rec.habitOrderByCategory as Record<string, unknown>,
+      )) {
+        if (typeof k !== 'string' || !Array.isArray(v)) continue
+        habitOrderByCategory[k] = v.filter(
+          (x): x is string => typeof x === 'string',
+        )
+      }
+    }
+    habitOrderByCategory = sanitizeHabitOrderMap(
+      normalizedHabits,
+      habitOrderByCategory,
+    )
+
     return {
-      version: 3,
+      version: 4,
       habits: normalizedHabits,
       completions,
       bestStreakByHabitId,
       milestoneSeen,
       customCategories,
+      habitOrderByCategory,
     }
   } catch {
     return empty()
@@ -398,6 +503,7 @@ type AppData = {
   bestStreakByHabitId: Record<string, number>
   milestoneSeen: Record<string, Record<string, true>>
   customCategories: string[]
+  habitOrderByCategory: HabitOrderMap
 }
 
 type ToastItem = { id: string; title: string; body: string }
@@ -409,6 +515,170 @@ type HabitDraft = {
   icon: string
 }
 
+type SortableHabitRowProps = {
+  habit: Habit
+  today: string
+  completions: Persisted['completions']
+  habitRates: Record<string, { week: RateResult; month: RateResult }>
+  bestStreakByHabitId: Record<string, number>
+  onToggle: (id: string) => void
+  onDelete: (id: string, name: string) => void
+  onEdit: (id: string) => void
+}
+
+function SortableHabitRow({
+  habit,
+  today,
+  completions,
+  habitRates,
+  bestStreakByHabitId,
+  onToggle,
+  onDelete,
+  onEdit,
+}: SortableHabitRowProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: habit.id })
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    zIndex: isDragging ? 1 : undefined,
+  }
+
+  const done = isCompleted(completions, habit.id, today)
+  const streak = habitStreak(completions, habit.id)
+  const best = bestStreakByHabitId[habit.id] ?? 0
+  const showStreakRow = streak > 0 || best > 0
+  const hr = habitRates[habit.id]
+
+  return (
+    <li
+      ref={setNodeRef}
+      style={{
+        ...style,
+        borderLeft: `3px solid ${habit.color}`,
+        opacity: isDragging ? 0.92 : undefined,
+      }}
+      title={formatRateTooltip(hr.week, hr.month)}
+      className="group flex items-stretch gap-1 rounded-2xl border border-y border-r border-zinc-800/90 bg-zinc-900/50 py-2 pl-1 pr-2 shadow-sm transition-colors hover:border-zinc-700/90"
+    >
+      <button
+        type="button"
+        className="flex w-8 shrink-0 cursor-grab touch-none items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 active:cursor-grabbing"
+        aria-label={`Reorder ${habit.name}`}
+        {...attributes}
+        {...listeners}
+      >
+        <svg
+          className="h-5 w-5"
+          viewBox="0 0 20 20"
+          fill="currentColor"
+          aria-hidden
+        >
+          <circle cx="6" cy="5" r="1.5" />
+          <circle cx="14" cy="5" r="1.5" />
+          <circle cx="6" cy="10" r="1.5" />
+          <circle cx="14" cy="10" r="1.5" />
+          <circle cx="6" cy="15" r="1.5" />
+          <circle cx="14" cy="15" r="1.5" />
+        </svg>
+      </button>
+      <span
+        className="flex w-9 shrink-0 select-none items-center justify-center text-xl leading-none"
+        aria-hidden
+      >
+        {habit.icon}
+      </span>
+      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+        <span className="relative flex h-11 w-11 shrink-0 items-center justify-center">
+          <input
+            type="checkbox"
+            checked={done}
+            onChange={() => onToggle(habit.id)}
+            className="peer absolute h-full w-full cursor-pointer opacity-0"
+          />
+          <span
+            className={[
+              'flex h-10 w-10 items-center justify-center rounded-xl border-2 transition-all duration-300 ease-out',
+              done
+                ? 'scale-100 shadow-[0_0_0_4px_rgba(255,255,255,0.06)]'
+                : 'border-zinc-600 bg-zinc-800/80 peer-hover:border-zinc-500 peer-active:scale-95',
+            ].join(' ')}
+            style={
+              done
+                ? {
+                    borderColor: habit.color,
+                    backgroundColor: `${habit.color}22`,
+                  }
+                : undefined
+            }
+            aria-hidden
+          >
+            <svg
+              viewBox="0 0 24 24"
+              className={[
+                'h-5 w-5 transition-all duration-300 ease-out',
+                done ? 'scale-100 opacity-100' : 'scale-50 opacity-0',
+              ].join(' ')}
+              style={done ? { color: habit.color } : undefined}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M5 13l4 4L19 7" />
+            </svg>
+          </span>
+        </span>
+        <span className="min-w-0 flex-1">
+          <span
+            className={[
+              'block truncate text-base font-medium transition-colors duration-200',
+              done
+                ? 'text-zinc-400 line-through decoration-zinc-600'
+                : 'text-zinc-100',
+            ].join(' ')}
+          >
+            {habit.name}
+          </span>
+          {showStreakRow && (
+            <span className="mt-0.5 block text-xs text-amber-400/95">
+              🔥 {streak}
+              {best > 0 ? (
+                <span className="text-zinc-500"> (best: {best})</span>
+              ) : null}
+            </span>
+          )}
+        </span>
+      </label>
+      <div className="flex shrink-0 flex-col justify-center gap-0.5 self-stretch sm:flex-row sm:items-center">
+        <button
+          type="button"
+          onClick={() => onEdit(habit.id)}
+          className="rounded-lg px-2 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
+        >
+          Edit
+        </button>
+        <button
+          type="button"
+          onClick={() => onDelete(habit.id, habit.name)}
+          className="rounded-lg px-2 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
+          aria-label={`Delete ${habit.name}`}
+        >
+          Delete
+        </button>
+      </div>
+    </li>
+  )
+}
+
 export default function App() {
   const [data, setData] = useState<AppData>(() => {
     const p = loadPersisted()
@@ -418,10 +688,17 @@ export default function App() {
       bestStreakByHabitId: p.bestStreakByHabitId,
       milestoneSeen: p.milestoneSeen,
       customCategories: p.customCategories,
+      habitOrderByCategory: p.habitOrderByCategory,
     }
   })
-  const { habits, completions, bestStreakByHabitId, milestoneSeen, customCategories } =
-    data
+  const {
+    habits,
+    completions,
+    bestStreakByHabitId,
+    milestoneSeen,
+    customCategories,
+    habitOrderByCategory,
+  } = data
   const [habitModal, setHabitModal] = useState<
     null | { mode: 'add' } | { mode: 'edit'; id: string }
   >(null)
@@ -441,14 +718,22 @@ export default function App() {
 
   useEffect(() => {
     savePersisted({
-      version: 3,
+      version: 4,
       habits,
       completions,
       bestStreakByHabitId,
       milestoneSeen,
       customCategories,
+      habitOrderByCategory,
     })
-  }, [habits, completions, bestStreakByHabitId, milestoneSeen, customCategories])
+  }, [
+    habits,
+    completions,
+    bestStreakByHabitId,
+    milestoneSeen,
+    customCategories,
+    habitOrderByCategory,
+  ])
 
   useEffect(() => {
     if (!habitModal) return
@@ -602,9 +887,13 @@ export default function App() {
     ordered.push(...rest)
     return ordered.map((category) => ({
       category,
-      habits: map.get(category)!,
+      habits: mergeOrderWithHabits(
+        category,
+        map.get(category)!,
+        habitOrderByCategory,
+      ),
     }))
-  }, [habits])
+  }, [habits, habitOrderByCategory])
 
   const total = habits.length
   const allDone = total > 0 && completedToday === total
@@ -653,21 +942,31 @@ export default function App() {
       }
 
       if (modal.mode === 'add') {
+        const nextHabits = [
+          ...s.habits,
+          { id: crypto.randomUUID(), name, category, color, icon },
+        ]
         return {
           ...s,
           customCategories: nextCustom,
-          habits: [
-            ...s.habits,
-            { id: crypto.randomUUID(), name, category, color, icon },
-          ],
+          habits: nextHabits,
+          habitOrderByCategory: sanitizeHabitOrderMap(
+            nextHabits,
+            s.habitOrderByCategory,
+          ),
         }
       }
       const id = modal.id
+      const nextHabits = s.habits.map((h) =>
+        h.id === id ? { ...h, name, category, color, icon } : h,
+      )
       return {
         ...s,
         customCategories: nextCustom,
-        habits: s.habits.map((h) =>
-          h.id === id ? { ...h, name, category, color, icon } : h,
+        habits: nextHabits,
+        habitOrderByCategory: sanitizeHabitOrderMap(
+          nextHabits,
+          s.habitOrderByCategory,
         ),
       }
     })
@@ -720,12 +1019,57 @@ export default function App() {
       for (const k of milestoneToastDedupeRef.current) {
         if (k.startsWith(`${id}-`)) milestoneToastDedupeRef.current.delete(k)
       }
+      const nextHabits = s.habits.filter((h) => h.id !== id)
       return {
-        habits: s.habits.filter((h) => h.id !== id),
+        habits: nextHabits,
         completions: nextCompletions,
         bestStreakByHabitId: nextBest,
         milestoneSeen: nextSeen,
         customCategories: s.customCategories,
+        habitOrderByCategory: sanitizeHabitOrderMap(
+          nextHabits,
+          s.habitOrderByCategory,
+        ),
+      }
+    })
+  }, [])
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: { distance: 8 },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  )
+
+  const onHabitDragEnd = useCallback((event: DragEndEvent) => {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+    const activeId = String(active.id)
+    const overId = String(over.id)
+    setData((s) => {
+      const catA = findCategoryForHabitId(s.habits, activeId)
+      const catO = findCategoryForHabitId(s.habits, overId)
+      if (!catA || catA !== catO) return s
+      const inCat = s.habits.filter(
+        (h) => (h.category?.trim() || 'Other') === catA,
+      )
+      const ordered = mergeOrderWithHabits(
+        catA,
+        inCat,
+        s.habitOrderByCategory,
+      ).map((h) => h.id)
+      const oldIndex = ordered.indexOf(activeId)
+      const newIndex = ordered.indexOf(overId)
+      if (oldIndex < 0 || newIndex < 0) return s
+      const nextIds = arrayMove(ordered, oldIndex, newIndex)
+      return {
+        ...s,
+        habitOrderByCategory: {
+          ...s.habitOrderByCategory,
+          [catA]: nextIds,
+        },
       }
     })
   }, [])
@@ -921,134 +1265,55 @@ export default function App() {
           </div>
         )}
 
-        <div className="flex flex-1 flex-col gap-6">
-          {habits.length === 0 ? (
-            <p className="text-center text-sm text-zinc-500">
-              No habits yet. Tap &quot;Add habit&quot; below.
-            </p>
-          ) : (
-            habitsByCategory.map(({ category, habits: catHabits }) => (
-              <section key={category}>
-                <h2 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
-                  <span className="h-px min-w-[1rem] flex-1 bg-zinc-800" aria-hidden />
-                  <span className="shrink-0">{category}</span>
-                  <span className="h-px min-w-[1rem] flex-1 bg-zinc-800" aria-hidden />
-                </h2>
-                <ul className="flex flex-col gap-3">
-                  {catHabits.map((habit) => {
-                    const done = isCompleted(completions, habit.id, today)
-                    const streak = habitStreak(completions, habit.id)
-                    const best = bestStreakByHabitId[habit.id] ?? 0
-                    const showStreakRow = streak > 0 || best > 0
-                    const hr = habitRates[habit.id]
-                    return (
-                      <li
-                        key={habit.id}
-                        title={formatRateTooltip(hr.week, hr.month)}
-                        style={{ borderLeft: `3px solid ${habit.color}` }}
-                        className="group flex items-stretch gap-2 rounded-2xl border border-y border-r border-zinc-800/90 bg-zinc-900/50 py-2 pl-2 pr-2 shadow-sm transition-colors hover:border-zinc-700/90"
-                      >
-                      <span
-                        className="flex w-9 shrink-0 select-none items-center justify-center text-xl leading-none"
-                        aria-hidden
-                      >
-                        {habit.icon}
-                      </span>
-                      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
-                        <span className="relative flex h-11 w-11 shrink-0 items-center justify-center">
-                          <input
-                            type="checkbox"
-                            checked={done}
-                            onChange={() => toggle(habit.id)}
-                            className="peer absolute h-full w-full cursor-pointer opacity-0"
-                          />
-                          <span
-                            className={[
-                              'flex h-10 w-10 items-center justify-center rounded-xl border-2 transition-all duration-300 ease-out',
-                              done
-                                ? 'scale-100 shadow-[0_0_0_4px_rgba(255,255,255,0.06)]'
-                                : 'border-zinc-600 bg-zinc-800/80 peer-hover:border-zinc-500 peer-active:scale-95',
-                            ].join(' ')}
-                            style={
-                              done
-                                ? {
-                                    borderColor: habit.color,
-                                    backgroundColor: `${habit.color}22`,
-                                  }
-                                : undefined
-                            }
-                            aria-hidden
-                          >
-                            <svg
-                              viewBox="0 0 24 24"
-                              className={[
-                                'h-5 w-5 transition-all duration-300 ease-out',
-                                done
-                                  ? 'scale-100 opacity-100'
-                                  : 'scale-50 opacity-0',
-                              ].join(' ')}
-                              style={done ? { color: habit.color } : undefined}
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2.5"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            >
-                              <path d="M5 13l4 4L19 7" />
-                            </svg>
-                          </span>
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span
-                            className={[
-                              'block truncate text-base font-medium transition-colors duration-200',
-                              done
-                                ? 'text-zinc-400 line-through decoration-zinc-600'
-                                : 'text-zinc-100',
-                            ].join(' ')}
-                          >
-                            {habit.name}
-                          </span>
-                          {showStreakRow && (
-                            <span className="mt-0.5 block text-xs text-amber-400/95">
-                              🔥 {streak}
-                              {best > 0 ? (
-                                <span className="text-zinc-500">
-                                  {' '}
-                                  (best: {best})
-                                </span>
-                              ) : null}
-                            </span>
-                          )}
-                        </span>
-                      </label>
-                      <div className="flex shrink-0 flex-col justify-center gap-0.5 self-stretch sm:flex-row sm:items-center">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setHabitModal({ mode: 'edit', id: habit.id })
-                          }
-                          className="rounded-lg px-2 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => deleteHabit(habit.id, habit.name)}
-                          className="rounded-lg px-2 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
-                          aria-label={`Delete ${habit.name}`}
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </li>
-                  )
-                })}
-              </ul>
-            </section>
-            ))
-          )}
-        </div>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={onHabitDragEnd}
+        >
+          <div className="flex flex-1 flex-col gap-6">
+            {habits.length === 0 ? (
+              <p className="text-center text-sm text-zinc-500">
+                No habits yet. Tap &quot;Add habit&quot; below.
+              </p>
+            ) : (
+              habitsByCategory.map(({ category, habits: catHabits }) => (
+                <section key={category}>
+                  <h2 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                    <span
+                      className="h-px min-w-[1rem] flex-1 bg-zinc-800"
+                      aria-hidden
+                    />
+                    <span className="shrink-0">{category}</span>
+                    <span
+                      className="h-px min-w-[1rem] flex-1 bg-zinc-800"
+                      aria-hidden
+                    />
+                  </h2>
+                  <SortableContext
+                    items={catHabits.map((h) => h.id)}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    <ul className="flex flex-col gap-3">
+                      {catHabits.map((habit) => (
+                        <SortableHabitRow
+                          key={habit.id}
+                          habit={habit}
+                          today={today}
+                          completions={completions}
+                          habitRates={habitRates}
+                          bestStreakByHabitId={bestStreakByHabitId}
+                          onToggle={toggle}
+                          onDelete={deleteHabit}
+                          onEdit={(id) => setHabitModal({ mode: 'edit', id })}
+                        />
+                      ))}
+                    </ul>
+                  </SortableContext>
+                </section>
+              ))
+            )}
+          </div>
+        </DndContext>
 
         <section className="mt-8 border-t border-zinc-800/80 pt-6">
           <button
