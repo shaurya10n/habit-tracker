@@ -186,25 +186,6 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } | null {
 
 type RateResult = { done: number; total: number; pct: number }
 
-function completionRateOverall(
-  habits: Habit[],
-  completions: Persisted['completions'],
-  dates: string[],
-): RateResult {
-  const n = habits.length
-  const total = n * dates.length
-  if (total === 0) return { done: 0, total: 0, pct: 0 }
-  let done = 0
-  for (const date of dates) {
-    const map = completions[date]
-    if (!map) continue
-    for (const h of habits) {
-      if (map[h.id]) done++
-    }
-  }
-  return { done, total, pct: Math.round((done / total) * 100) }
-}
-
 function completionRateHabit(
   completions: Persisted['completions'],
   habitId: string,
@@ -1154,33 +1135,24 @@ export default function App() {
     return habits.filter((h) => day[h.id]).length
   }, [habits, completions, activeLogDate])
 
-  const { weekDates, monthDates, weekOverall, monthOverall, habitRates } =
-    useMemo(() => {
-      const end = parseYMD(today)
-      const weekStart = startOfWeekMonday(end)
-      const monthStart = startOfMonth(end)
-      const wd = enumerateYMDInclusive(weekStart, end)
-      const md = enumerateYMDInclusive(monthStart, end)
-      const weekOverall = completionRateOverall(habits, completions, wd)
-      const monthOverall = completionRateOverall(habits, completions, md)
-      const habitRates: Record<
-        string,
-        { week: RateResult; month: RateResult }
-      > = {}
-      for (const h of habits) {
-        habitRates[h.id] = {
-          week: completionRateHabit(completions, h.id, wd),
-          month: completionRateHabit(completions, h.id, md),
-        }
+  const habitRates = useMemo(() => {
+    const end = parseYMD(today)
+    const weekStart = startOfWeekMonday(end)
+    const monthStart = startOfMonth(end)
+    const wd = enumerateYMDInclusive(weekStart, end)
+    const md = enumerateYMDInclusive(monthStart, end)
+    const rates: Record<
+      string,
+      { week: RateResult; month: RateResult }
+    > = {}
+    for (const h of habits) {
+      rates[h.id] = {
+        week: completionRateHabit(completions, h.id, wd),
+        month: completionRateHabit(completions, h.id, md),
       }
-      return {
-        weekDates: wd,
-        monthDates: md,
-        weekOverall,
-        monthOverall,
-        habitRates,
-      }
-    }, [habits, completions, today])
+    }
+    return rates
+  }, [habits, completions, today])
 
   const categoryOptions = useMemo(() => {
     const customs = customCategories.filter(
@@ -1562,96 +1534,6 @@ export default function App() {
               className="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-500 ease-out"
               style={{ width: `${progressPct}%` }}
             />
-          </div>
-
-          <div className="mt-5 border-t border-zinc-800/80 pt-4">
-            <h2 className="mb-3 text-xs font-medium uppercase tracking-wider text-zinc-500">
-              Summary
-            </h2>
-            {total === 0 ? (
-              <p className="text-sm text-zinc-500">
-                Add habits to see weekly and monthly completion rates.
-              </p>
-            ) : (
-              <>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div className="rounded-xl border border-zinc-800/90 bg-zinc-950/40 px-3 py-2.5">
-                    <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-                      This week
-                    </p>
-                    <p className="mt-0.5 text-lg font-semibold tabular-nums text-zinc-100">
-                      {weekOverall.pct}%
-                    </p>
-                    <p className="mt-0.5 text-xs text-zinc-500">
-                      Mon–today · {weekDates.length} day
-                      {weekDates.length === 1 ? '' : 's'} ·{' '}
-                      {weekOverall.done}/{weekOverall.total} checks
-                    </p>
-                  </div>
-                  <div className="rounded-xl border border-zinc-800/90 bg-zinc-950/40 px-3 py-2.5">
-                    <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-                      This month
-                    </p>
-                    <p className="mt-0.5 text-lg font-semibold tabular-nums text-zinc-100">
-                      {monthOverall.pct}%
-                    </p>
-                    <p className="mt-0.5 text-xs text-zinc-500">
-                      Month to date · {monthDates.length} day
-                      {monthDates.length === 1 ? '' : 's'} ·{' '}
-                      {monthOverall.done}/{monthOverall.total} checks
-                    </p>
-                  </div>
-                </div>
-
-                <details className="group/stats mt-3 rounded-xl border border-zinc-800/80 bg-zinc-950/30">
-                  <summary className="cursor-pointer list-none px-3 py-2.5 text-sm font-medium text-zinc-300 outline-none marker:content-none [&::-webkit-details-marker]:hidden">
-                    <span className="flex items-center justify-between gap-2">
-                      <span>Per-habit breakdown</span>
-                      <span className="flex shrink-0 items-center gap-2 text-xs font-normal text-zinc-500">
-                        <span className="group-open/stats:hidden">Expand</span>
-                        <span className="hidden group-open/stats:inline">
-                          Collapse
-                        </span>
-                      </span>
-                    </span>
-                  </summary>
-                  <div className="border-t border-zinc-800/80 px-3 py-2">
-                    <p className="mb-2 text-xs text-zinc-500">
-                      Share of days each habit was completed (same ranges as
-                      above).
-                    </p>
-                    <ul className="max-h-48 space-y-2 overflow-y-auto pr-1 text-sm">
-                      {habits.map((h) => {
-                        const r = habitRates[h.id]
-                        return (
-                          <li
-                            key={`stat-${h.id}`}
-                            className="flex items-baseline justify-between gap-2 border-b border-zinc-800/50 pb-2 last:border-0 last:pb-0"
-                          >
-                            <span className="flex min-w-0 items-center gap-2 text-zinc-300">
-                              <span
-                                className="shrink-0 text-base leading-none"
-                                aria-hidden
-                              >
-                                {h.icon}
-                              </span>
-                              <span className="truncate">{h.name}</span>
-                            </span>
-                            <span className="shrink-0 tabular-nums text-zinc-400">
-                              <span className="text-zinc-200">{r.week.pct}%</span>
-                              <span className="text-zinc-600"> wk</span>
-                              <span className="mx-1.5 text-zinc-600">·</span>
-                              <span className="text-zinc-200">{r.month.pct}%</span>
-                              <span className="text-zinc-600"> mo</span>
-                            </span>
-                          </li>
-                        )
-                      })}
-                    </ul>
-                  </div>
-                </details>
-              </>
-            )}
           </div>
         </section>
 
