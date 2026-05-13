@@ -1,0 +1,51 @@
+# Dependencies
+node_modules
+
+# Build
+dist
+dist-ssr
+
+# Local-only files (e.g. Vite *.local certs)
+*.local
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Env (secrets — keep out of GitHub)
+.env
+.env.*
+!.env.example
+
+# Test / coverage
+coverage
+*.lcov
+
+# TypeScript
+*.tsbuildinfo
+
+# Caches
+.cache
+.parcel-cache
+.turbo
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.sw?
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
