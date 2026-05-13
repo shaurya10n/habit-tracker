@@ -754,6 +754,146 @@ function dayOverallCompletion(
   return { done, total: n, pct: Math.round((done / n) * 100) }
 }
 
+function anyHabitCompletedOnDate(
+  completions: Persisted['completions'],
+  habits: Habit[],
+  ymd: string,
+): boolean {
+  if (habits.length === 0) return false
+  const map = completions[ymd]
+  if (!map) return false
+  for (const h of habits) {
+    if (map[h.id]) return true
+  }
+  return false
+}
+
+/** Consecutive days (ending today-or-yesterday rule) where at least one habit was completed. */
+function globalActivityStreak(
+  completions: Persisted['completions'],
+  habits: Habit[],
+  todayYMD: string,
+): number {
+  if (habits.length === 0) return 0
+  const d = parseYMD(todayYMD)
+  if (!anyHabitCompletedOnDate(completions, habits, todayYMD)) {
+    d.setDate(d.getDate() - 1)
+  }
+  let streak = 0
+  for (;;) {
+    const key = formatYMD(d)
+    if (!anyHabitCompletedOnDate(completions, habits, key)) break
+    streak++
+    d.setDate(d.getDate() - 1)
+  }
+  return streak
+}
+
+function datesWithAnyActivity(
+  completions: Persisted['completions'],
+  habits: Habit[],
+): string[] {
+  const set = new Set<string>()
+  for (const [date, map] of Object.entries(completions)) {
+    if (!map) continue
+    for (const h of habits) {
+      if (map[h.id]) {
+        set.add(date)
+        break
+      }
+    }
+  }
+  return [...set].sort()
+}
+
+function maxGlobalActivityStreakInHistory(
+  completions: Persisted['completions'],
+  habits: Habit[],
+): number {
+  const dates = datesWithAnyActivity(completions, habits)
+  if (dates.length === 0) return 0
+  let bestRun = 1
+  let curRun = 1
+  const dayMs = 86400000
+  for (let i = 1; i < dates.length; i++) {
+    const a = parseYMD(dates[i - 1])
+    const b = parseYMD(dates[i])
+    const diff = Math.round((b.getTime() - a.getTime()) / dayMs)
+    if (diff === 1) {
+      curRun++
+      if (curRun > bestRun) bestRun = curRun
+    } else if (diff !== 0) {
+      curRun = 1
+    }
+  }
+  return bestRun
+}
+
+function totalCompletionChecks(
+  completions: Persisted['completions'],
+  habits: Habit[],
+): number {
+  if (habits.length === 0) return 0
+  const ids = new Set(habits.map((h) => h.id))
+  let n = 0
+  for (const map of Object.values(completions)) {
+    if (!map) continue
+    for (const [id, v] of Object.entries(map)) {
+      if (v === true && ids.has(id)) n++
+    }
+  }
+  return n
+}
+
+function isPerfectDay(
+  ymd: string,
+  completions: Persisted['completions'],
+  habits: Habit[],
+): boolean {
+  if (habits.length === 0) return false
+  const map = completions[ymd]
+  if (!map) return false
+  for (const h of habits) {
+    if (!map[h.id]) return false
+  }
+  return true
+}
+
+function countPerfectDaysAllTime(
+  completions: Persisted['completions'],
+  habits: Habit[],
+): number {
+  if (habits.length === 0) return 0
+  let c = 0
+  for (const date of Object.keys(completions)) {
+    if (isPerfectDay(date, completions, habits)) c++
+  }
+  return c
+}
+
+function perfectDaysThisMonth(
+  completions: Persisted['completions'],
+  habits: Habit[],
+  todayYMD: string,
+): { perfect: number; elapsed: number } {
+  const end = parseYMD(todayYMD)
+  const start = startOfMonth(end)
+  const days = enumerateYMDInclusive(start, end)
+  if (habits.length === 0) return { perfect: 0, elapsed: days.length }
+  let perfect = 0
+  for (const ymd of days) {
+    if (isPerfectDay(ymd, completions, habits)) perfect++
+  }
+  return { perfect, elapsed: days.length }
+}
+
+function nextStreakMilestone(streak: number): number | null {
+  for (const m of STREAK_MILESTONES) {
+    if (streak < m) return m
+  }
+  return null
+}
+
 type HeatmapStatsViewProps = {
   habits: Habit[]
   completions: Persisted['completions']
@@ -766,6 +906,41 @@ function HeatmapStatsView({
   todayYMD,
 }: HeatmapStatsViewProps) {
   const [focusHabitId, setFocusHabitId] = useState('')
+
+  const glance = useMemo(() => {
+    const currentGlobal = globalActivityStreak(
+      completions,
+      habits,
+      todayYMD,
+    )
+    const bestGlobal = maxGlobalActivityStreakInHistory(completions, habits)
+    const totalChecks = totalCompletionChecks(completions, habits)
+    const perfectAll = countPerfectDaysAllTime(completions, habits)
+    const { perfect: perfectMonth, elapsed: elapsedMonth } =
+      perfectDaysThisMonth(completions, habits, todayYMD)
+    return {
+      currentGlobal,
+      bestGlobal,
+      totalChecks,
+      perfectAll,
+      perfectMonth,
+      elapsedMonth,
+    }
+  }, [habits, completions, todayYMD])
+
+  const upcomingMilestones = useMemo(() => {
+    type Row = { habit: Habit; streak: number; next: number; gap: number }
+    const rows: Row[] = []
+    for (const h of habits) {
+      const streak = habitStreak(completions, h.id)
+      const next = nextStreakMilestone(streak)
+      if (next === null) continue
+      const gap = next - streak
+      if (gap >= 1 && gap <= 5) rows.push({ habit: h, streak, next, gap })
+    }
+    rows.sort((a, b) => a.gap - b.gap || b.streak - a.streak)
+    return rows
+  }, [habits, completions])
 
   const rangeStartYMD = useMemo(() => monthFirstYMD(todayYMD, 2), [todayYMD])
 
@@ -839,15 +1014,170 @@ function HeatmapStatsView({
   const weekDayLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-8">
       <div>
         <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-3xl">
           Stats
         </h1>
         <p className="mt-1 text-sm text-zinc-500">
-          Last 3 calendar months — daily completion from your saved history.
+          Summary and milestones from your history — then the activity
+          calendar.
         </p>
       </div>
+
+      <section aria-labelledby="stats-glance-heading">
+        <h2
+          id="stats-glance-heading"
+          className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500"
+        >
+          At a glance
+        </h2>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <div className="rounded-2xl border border-amber-500/30 bg-gradient-to-br from-amber-950/60 via-zinc-900/90 to-zinc-950 p-4 shadow-lg shadow-black/20">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-200/90">
+              Streak
+            </p>
+            <p className="mt-3 text-sm leading-relaxed text-zinc-200">
+              <span aria-hidden>🔥</span>{' '}
+              <span className="font-semibold tabular-nums text-white">
+                {glance.currentGlobal}
+              </span>{' '}
+              day{glance.currentGlobal === 1 ? '' : 's'} current
+              <span className="mx-2 text-zinc-600">|</span>
+              <span aria-hidden>🏆</span>{' '}
+              <span className="font-semibold tabular-nums text-white">
+                {glance.bestGlobal}
+              </span>{' '}
+              day{glance.bestGlobal === 1 ? '' : 's'} best
+            </p>
+            <p className="mt-2 text-xs text-zinc-500">
+              Any day you complete at least one habit counts.
+            </p>
+          </div>
+
+          <div className="rounded-2xl border border-emerald-500/30 bg-gradient-to-br from-emerald-950/50 via-zinc-900/90 to-zinc-950 p-4 shadow-lg shadow-black/20">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-200/90">
+              Total completions
+            </p>
+            <p className="mt-2 flex flex-wrap items-baseline gap-2">
+              <span className="text-3xl font-bold tabular-nums tracking-tight text-white sm:text-4xl">
+                {glance.totalChecks.toLocaleString()}
+              </span>
+              <span className="text-base text-emerald-400/95" aria-hidden>
+                ✅
+              </span>
+            </p>
+            <p className="mt-1 text-xs text-zinc-500">
+              Every habit check ever saved.
+            </p>
+          </div>
+
+          <div className="rounded-2xl border border-violet-500/30 bg-gradient-to-br from-violet-950/45 via-zinc-900/90 to-zinc-950 p-4 shadow-lg shadow-black/20">
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-violet-200/90">
+              Perfect days
+            </p>
+            <p className="mt-3 text-sm text-zinc-200">
+              <span aria-hidden>⭐</span>{' '}
+              <span className="font-semibold tabular-nums text-white">
+                {glance.perfectAll}
+              </span>{' '}
+              perfect day{glance.perfectAll === 1 ? '' : 's'}{' '}
+              <span className="text-zinc-500">
+                ({glance.perfectMonth} this month)
+              </span>
+            </p>
+            <p className="mt-2 text-xs text-zinc-500">
+              {glance.perfectMonth} of {glance.elapsedMonth} day
+              {glance.elapsedMonth === 1 ? '' : 's'} in this month so far — every
+              habit done.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="stats-milestones-heading">
+        <h2
+          id="stats-milestones-heading"
+          className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500"
+        >
+          Upcoming milestones
+        </h2>
+        {upcomingMilestones.length === 0 ? (
+          <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 px-4 py-8 text-center">
+            <p className="text-lg text-zinc-300">Keep going — milestones are coming!</p>
+            <p className="mt-2 text-sm text-zinc-500">
+              When you are within 5 days of a 7-, 30-, or 100-day streak, we will
+              cheer you on here.
+            </p>
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-3">
+            {upcomingMilestones.map(({ habit, streak, next, gap }) => {
+              const pct = Math.min(100, Math.round((streak / next) * 100))
+              const dayWord = gap === 1 ? 'day' : 'days'
+              return (
+                <li
+                  key={habit.id}
+                  className="rounded-2xl border border-zinc-800/90 bg-zinc-900/60 p-4 shadow-sm"
+                >
+                  <div className="flex flex-wrap items-start gap-3">
+                    <span
+                      className="text-2xl leading-none"
+                      aria-hidden
+                    >
+                      {habit.icon}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="font-medium text-zinc-100">{habit.name}</p>
+                      <p className="mt-1 text-sm text-zinc-400">
+                        Streak{' '}
+                        <span className="tabular-nums text-amber-300/95">
+                          {streak}
+                        </span>
+                        {' — '}
+                        <span className="text-zinc-300">
+                          {gap} more {dayWord} to your {next}-day streak 🎯
+                        </span>
+                      </p>
+                      <div
+                        className="mt-3 h-2 overflow-hidden rounded-full bg-zinc-800"
+                        role="progressbar"
+                        aria-valuenow={streak}
+                        aria-valuemin={0}
+                        aria-valuemax={next}
+                        aria-label={`Progress toward ${next}-day streak`}
+                      >
+                        <div
+                          className="h-full rounded-full transition-all duration-300"
+                          style={{
+                            width: `${pct}%`,
+                            backgroundColor: habit.color,
+                            opacity: 0.85,
+                          }}
+                        />
+                      </div>
+                      <p className="mt-1 text-right text-[10px] tabular-nums text-zinc-600">
+                        {streak} / {next}
+                      </p>
+                    </div>
+                  </div>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </section>
+
+      <section aria-labelledby="stats-calendar-heading">
+        <h2
+          id="stats-calendar-heading"
+          className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-500"
+        >
+          Activity calendar
+        </h2>
+        <p className="mb-3 text-sm text-zinc-500">
+          Last 3 calendar months — daily completion from your saved history.
+        </p>
 
       <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end sm:justify-between">
         <div className="flex flex-wrap gap-2">
@@ -998,6 +1328,7 @@ function HeatmapStatsView({
           <span>More</span>
         </div>
       </div>
+      </section>
     </div>
   )
 }
