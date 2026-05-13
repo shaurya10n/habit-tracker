@@ -361,10 +361,11 @@ function backfillStreakFields(
   const milestoneSeen: Record<string, Record<string, true>> = {}
   for (const h of habits) {
     const streak = habitStreak(completions, h.id)
-    bestStreakByHabitId[h.id] = streak
+    const historyMax = maxConsecutiveStreakInHistory(completions, h.id)
+    bestStreakByHabitId[h.id] = historyMax
     const seen: Record<string, true> = {}
     for (const m of STREAK_MILESTONES) {
-      if (streak >= m) seen[String(m)] = true
+      if (historyMax >= m || streak >= m) seen[String(m)] = true
     }
     if (Object.keys(seen).length > 0) milestoneSeen[h.id] = seen
   }
@@ -433,10 +434,10 @@ function loadPersisted(): Persisted {
       }
       for (const h of normalizedHabits) {
         const streak = habitStreak(completions, h.id)
-        const prev = bestStreakByHabitId[h.id] ?? 0
-        if (streak > prev) bestStreakByHabitId[h.id] = streak
+        const historyMax = maxConsecutiveStreakInHistory(completions, h.id)
+        bestStreakByHabitId[h.id] = historyMax
         for (const m of STREAK_MILESTONES) {
-          if (streak >= m) {
+          if (historyMax >= m || streak >= m) {
             if (!milestoneSeen[h.id]) milestoneSeen[h.id] = {}
             milestoneSeen[h.id][String(m)] = true
           }
@@ -513,6 +514,34 @@ function habitStreak(
     d.setDate(d.getDate() - 1)
   }
   return streak
+}
+
+/** Longest calendar run of completed days for this habit anywhere in stored history (drops when days are unchecked). */
+function maxConsecutiveStreakInHistory(
+  completions: Persisted['completions'],
+  habitId: string,
+): number {
+  const dates: string[] = []
+  for (const [date, map] of Object.entries(completions)) {
+    if (map?.[habitId] === true) dates.push(date)
+  }
+  if (dates.length === 0) return 0
+  dates.sort()
+  let bestRun = 1
+  let curRun = 1
+  const dayMs = 86400000
+  for (let i = 1; i < dates.length; i++) {
+    const a = parseYMD(dates[i - 1])
+    const b = parseYMD(dates[i])
+    const diff = Math.round((b.getTime() - a.getTime()) / dayMs)
+    if (diff === 1) {
+      curRun++
+      if (curRun > bestRun) bestRun = curRun
+    } else if (diff !== 0) {
+      curRun = 1
+    }
+  }
+  return bestRun
 }
 
 type AppData = {
@@ -1075,9 +1104,10 @@ export default function App() {
 
       for (const h of d.habits) {
         const streak = habitStreak(d.completions, h.id)
+        const historyMax = maxConsecutiveStreakInHistory(d.completions, h.id)
         const prevBest = nextBest[h.id] ?? 0
-        if (streak > prevBest) {
-          nextBest[h.id] = streak
+        if (historyMax !== prevBest) {
+          nextBest[h.id] = historyMax
           changed = true
         }
 
