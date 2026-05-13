@@ -9,25 +9,84 @@ import {
 const STORAGE_KEY = 'habit-tracker-v1'
 const STREAK_MILESTONES = [7, 30, 100] as const
 
-const DEFAULT_HABIT_NAMES = [
-  'Apply to Jobs',
-  'Exercise',
-  'Creatine',
-  'Supplements',
-  'Mobility',
-  'Cold Shower',
+const PRESET_CATEGORIES = [
+  'Health',
+  'Fitness',
+  'Career',
+  'Mindset',
+  'Other',
 ] as const
 
-type Habit = { id: string; name: string }
+const COLOR_PRESETS = [
+  '#22c55e',
+  '#14b8a6',
+  '#3b82f6',
+  '#8b5cf6',
+  '#ec4899',
+  '#f97316',
+  '#eab308',
+  '#ef4444',
+  '#06b6d4',
+  '#a855f7',
+  '#64748b',
+] as const
+
+const EMOJI_ICONS = [
+  '🔥',
+  '💪',
+  '📚',
+  '🧠',
+  '💧',
+  '🏃',
+  '🎯',
+  '✨',
+  '🌅',
+  '🍎',
+  '💼',
+  '🧘',
+  '❄️',
+  '✅',
+  '⭐️',
+  '📝',
+  '🥗',
+  '🛏️',
+  '☀️',
+  '🎵',
+  '❤️',
+] as const
+
+const DEFAULT_HABIT_SEED: {
+  name: string
+  category: string
+  color: string
+  icon: string
+}[] = [
+  { name: 'Apply to Jobs', category: 'Career', color: '#3b82f6', icon: '💼' },
+  { name: 'Exercise', category: 'Fitness', color: '#f97316', icon: '🏃' },
+  { name: 'Creatine', category: 'Health', color: '#22c55e', icon: '💧' },
+  { name: 'Supplements', category: 'Health', color: '#14b8a6', icon: '🍎' },
+  { name: 'Mobility', category: 'Fitness', color: '#8b5cf6', icon: '🧘' },
+  { name: 'Cold Shower', category: 'Health', color: '#06b6d4', icon: '❄️' },
+]
+
+type Habit = {
+  id: string
+  name: string
+  category: string
+  color: string
+  icon: string
+}
 
 type Persisted = {
-  version: 2
+  version: 3
   habits: Habit[]
   /** YYYY-MM-DD → habitId → completed */
   completions: Record<string, Record<string, true>>
   bestStreakByHabitId: Record<string, number>
   /** habitId → milestone day string "7" | "30" | "100" → shown once */
   milestoneSeen: Record<string, Record<string, true>>
+  /** User-defined category labels (not in presets) */
+  customCategories: string[]
 }
 
 function formatYMD(d: Date): string {
@@ -114,10 +173,72 @@ function formatRateTooltip(week: RateResult, month: RateResult): string {
   return `${w} · ${mo}`
 }
 
+function isHexColor(s: string): boolean {
+  return /^#[0-9A-Fa-f]{6}$/.test(s)
+}
+
+function normalizeHabit(h: unknown, index: number): Habit | null {
+  if (!h || typeof h !== 'object') return null
+  const o = h as Record<string, unknown>
+  if (typeof o.id !== 'string' || typeof o.name !== 'string' || !o.name.trim())
+    return null
+
+  const seed = DEFAULT_HABIT_SEED.find((s) => s.name === o.name)
+
+  let category =
+    typeof o.category === 'string' && o.category.trim()
+      ? o.category.trim()
+      : seed?.category ?? 'Other'
+
+  const colorRaw = typeof o.color === 'string' ? o.color.trim() : ''
+  let color = isHexColor(colorRaw)
+    ? colorRaw
+    : seed?.color ?? COLOR_PRESETS[index % COLOR_PRESETS.length]
+
+  const iconRaw = typeof o.icon === 'string' ? o.icon.trim() : ''
+  const iconFromSet = (EMOJI_ICONS as readonly string[]).includes(iconRaw)
+    ? iconRaw
+    : seed?.icon ?? EMOJI_ICONS[index % EMOJI_ICONS.length]
+
+  return {
+    id: o.id,
+    name: o.name.trim(),
+    category,
+    color,
+    icon: iconFromSet,
+  }
+}
+
+function mergeCustomCategories(
+  stored: string[] | undefined,
+  habits: Habit[],
+): string[] {
+  const preset = new Set<string>(PRESET_CATEGORIES as unknown as string[])
+  const out: string[] = []
+  if (Array.isArray(stored)) {
+    for (const c of stored) {
+      if (typeof c !== 'string') continue
+      const t = c.trim()
+      if (!t || preset.has(t)) continue
+      if (!out.includes(t)) out.push(t)
+    }
+  }
+  for (const h of habits) {
+    if (!preset.has(h.category) && !out.includes(h.category)) {
+      out.push(h.category)
+    }
+  }
+  out.sort((a, b) => a.localeCompare(b))
+  return out
+}
+
 function defaultHabits(): Habit[] {
-  return DEFAULT_HABIT_NAMES.map((name) => ({
+  return DEFAULT_HABIT_SEED.map((s) => ({
     id: crypto.randomUUID(),
-    name,
+    name: s.name,
+    category: s.category,
+    color: s.color,
+    icon: s.icon,
   }))
 }
 
@@ -150,92 +271,92 @@ function backfillStreakFields(
 }
 
 function loadPersisted(): Persisted {
-  const fresh = (): Persisted => ({
-    version: 2,
+  const empty = (): Persisted => ({
+    version: 3,
     habits: defaultHabits(),
     completions: {},
     bestStreakByHabitId: {},
     milestoneSeen: {},
+    customCategories: [],
   })
 
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return fresh()
+    if (!raw) return empty()
 
     const data = JSON.parse(raw) as unknown
-    if (!data || typeof data !== 'object') return fresh()
+    if (!data || typeof data !== 'object') return empty()
 
     const rec = data as Record<string, unknown>
     const habitsRaw = rec.habits
-    if (!Array.isArray(habitsRaw)) return fresh()
+    if (!Array.isArray(habitsRaw)) return empty()
 
-    const habits = habitsRaw.filter(
-      (h): h is Habit =>
-        typeof h?.id === 'string' &&
-        typeof h?.name === 'string' &&
-        h.name.length > 0,
-    )
     const completions =
       rec.completions && typeof rec.completions === 'object'
         ? (rec.completions as Persisted['completions'])
         : {}
 
-    if (habits.length === 0) return fresh()
+    const normalizedHabits: Habit[] = []
+    for (const h of habitsRaw) {
+      const nh = normalizeHabit(h, normalizedHabits.length)
+      if (nh) normalizedHabits.push(nh)
+    }
+    if (normalizedHabits.length === 0) return empty()
 
     const ver = rec.version
-    if (ver !== 2) {
-      const bf = backfillStreakFields(habits, completions)
-      return {
-        version: 2,
-        habits,
-        completions,
-        bestStreakByHabitId: bf.bestStreakByHabitId,
-        milestoneSeen: bf.milestoneSeen,
-      }
-    }
-
     let bestStreakByHabitId: Record<string, number> = {}
-    if (rec.bestStreakByHabitId && typeof rec.bestStreakByHabitId === 'object') {
-      for (const [k, v] of Object.entries(rec.bestStreakByHabitId)) {
-        if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
-          bestStreakByHabitId[k] = Math.floor(v)
-        }
-      }
-    }
-
     let milestoneSeen: Record<string, Record<string, true>> = {}
-    if (rec.milestoneSeen && typeof rec.milestoneSeen === 'object') {
-      for (const [hid, map] of Object.entries(rec.milestoneSeen)) {
-        if (!map || typeof map !== 'object') continue
-        const inner: Record<string, true> = {}
-        for (const [mk, mv] of Object.entries(map)) {
-          if (mv === true) inner[mk] = true
+
+    if (ver !== 3) {
+      const bf = backfillStreakFields(normalizedHabits, completions)
+      bestStreakByHabitId = bf.bestStreakByHabitId
+      milestoneSeen = bf.milestoneSeen
+    } else {
+      if (rec.bestStreakByHabitId && typeof rec.bestStreakByHabitId === 'object') {
+        for (const [k, v] of Object.entries(rec.bestStreakByHabitId)) {
+          if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+            bestStreakByHabitId[k] = Math.floor(v)
+          }
         }
-        if (Object.keys(inner).length > 0) milestoneSeen[hid] = inner
+      }
+      if (rec.milestoneSeen && typeof rec.milestoneSeen === 'object') {
+        for (const [hid, map] of Object.entries(rec.milestoneSeen)) {
+          if (!map || typeof map !== 'object') continue
+          const inner: Record<string, true> = {}
+          for (const [mk, mv] of Object.entries(map)) {
+            if (mv === true) inner[mk] = true
+          }
+          if (Object.keys(inner).length > 0) milestoneSeen[hid] = inner
+        }
+      }
+      for (const h of normalizedHabits) {
+        const streak = habitStreak(completions, h.id)
+        const prev = bestStreakByHabitId[h.id] ?? 0
+        if (streak > prev) bestStreakByHabitId[h.id] = streak
+        for (const m of STREAK_MILESTONES) {
+          if (streak >= m) {
+            if (!milestoneSeen[h.id]) milestoneSeen[h.id] = {}
+            milestoneSeen[h.id][String(m)] = true
+          }
+        }
       }
     }
 
-    for (const h of habits) {
-      const streak = habitStreak(completions, h.id)
-      const prev = bestStreakByHabitId[h.id] ?? 0
-      if (streak > prev) bestStreakByHabitId[h.id] = streak
-      for (const m of STREAK_MILESTONES) {
-        if (streak >= m) {
-          if (!milestoneSeen[h.id]) milestoneSeen[h.id] = {}
-          milestoneSeen[h.id][String(m)] = true
-        }
-      }
-    }
+    const storedCustom = Array.isArray(rec.customCategories)
+      ? (rec.customCategories as unknown[]).filter((x): x is string => typeof x === 'string')
+      : undefined
+    const customCategories = mergeCustomCategories(storedCustom, normalizedHabits)
 
     return {
-      version: 2,
-      habits,
+      version: 3,
+      habits: normalizedHabits,
       completions,
       bestStreakByHabitId,
       milestoneSeen,
+      customCategories,
     }
   } catch {
-    return fresh()
+    return empty()
   }
 }
 
@@ -276,9 +397,17 @@ type AppData = {
   completions: Persisted['completions']
   bestStreakByHabitId: Record<string, number>
   milestoneSeen: Record<string, Record<string, true>>
+  customCategories: string[]
 }
 
 type ToastItem = { id: string; title: string; body: string }
+
+type HabitDraft = {
+  name: string
+  category: string
+  color: string
+  icon: string
+}
 
 export default function App() {
   const [data, setData] = useState<AppData>(() => {
@@ -288,10 +417,21 @@ export default function App() {
       completions: p.completions,
       bestStreakByHabitId: p.bestStreakByHabitId,
       milestoneSeen: p.milestoneSeen,
+      customCategories: p.customCategories,
     }
   })
-  const { habits, completions, bestStreakByHabitId, milestoneSeen } = data
-  const [newName, setNewName] = useState('')
+  const { habits, completions, bestStreakByHabitId, milestoneSeen, customCategories } =
+    data
+  const [habitModal, setHabitModal] = useState<
+    null | { mode: 'add' } | { mode: 'edit'; id: string }
+  >(null)
+  const [draft, setDraft] = useState<HabitDraft>({
+    name: '',
+    category: PRESET_CATEGORIES[0],
+    color: COLOR_PRESETS[0],
+    icon: EMOJI_ICONS[0],
+  })
+  const [newCategoryInput, setNewCategoryInput] = useState('')
   const [toasts, setToasts] = useState<ToastItem[]>([])
   const milestoneToastDedupeRef = useRef(new Set<string>())
   const pendingMilestonesRef = useRef<{ name: string; m: number }[]>([])
@@ -301,13 +441,42 @@ export default function App() {
 
   useEffect(() => {
     savePersisted({
-      version: 2,
+      version: 3,
       habits,
       completions,
       bestStreakByHabitId,
       milestoneSeen,
+      customCategories,
     })
-  }, [habits, completions, bestStreakByHabitId, milestoneSeen])
+  }, [habits, completions, bestStreakByHabitId, milestoneSeen, customCategories])
+
+  useEffect(() => {
+    if (!habitModal) return
+    if (habitModal.mode === 'add') {
+      setDraft({
+        name: '',
+        category: PRESET_CATEGORIES[0],
+        color: COLOR_PRESETS[0],
+        icon: EMOJI_ICONS[0],
+      })
+      setNewCategoryInput('')
+      return
+    }
+    const h = habits.find((x) => x.id === habitModal.id)
+    if (!h) {
+      setHabitModal(null)
+      return
+    }
+    setDraft({
+      name: h.name,
+      category: h.category,
+      color: isHexColor(h.color) ? h.color : COLOR_PRESETS[0],
+      icon: (EMOJI_ICONS as readonly string[]).includes(h.icon)
+        ? h.icon
+        : EMOJI_ICONS[0],
+    })
+    setNewCategoryInput('')
+  }, [habitModal, habits])
 
   useEffect(() => {
     pendingMilestonesRef.current = []
@@ -407,6 +576,36 @@ export default function App() {
       }
     }, [habits, completions, today])
 
+  const categoryOptions = useMemo(() => {
+    const customs = customCategories.filter(
+      (c) => !(PRESET_CATEGORIES as readonly string[]).includes(c),
+    )
+    return [...PRESET_CATEGORIES, ...customs]
+  }, [customCategories])
+
+  const habitsByCategory = useMemo(() => {
+    const map = new Map<string, Habit[]>()
+    for (const h of habits) {
+      const cat = h.category?.trim() || 'Other'
+      if (!map.has(cat)) map.set(cat, [])
+      map.get(cat)!.push(h)
+    }
+    const preset = PRESET_CATEGORIES as readonly string[]
+    const ordered: string[] = []
+    for (const c of preset) {
+      if (map.has(c)) ordered.push(c)
+    }
+    const rest = [...map.keys()].filter(
+      (c) => !(preset as readonly string[]).includes(c),
+    )
+    rest.sort((a, b) => a.localeCompare(b))
+    ordered.push(...rest)
+    return ordered.map((category) => ({
+      category,
+      habits: map.get(category)!,
+    }))
+  }, [habits])
+
   const total = habits.length
   const allDone = total > 0 && completedToday === total
   const progressPct = total === 0 ? 0 : Math.round((completedToday / total) * 100)
@@ -434,15 +633,75 @@ export default function App() {
     [today],
   )
 
-  const addHabit = useCallback(() => {
-    const name = newName.trim()
-    if (!name) return
-    setData((s) => ({
-      ...s,
-      habits: [...s.habits, { id: crypto.randomUUID(), name }],
-    }))
-    setNewName('')
-  }, [newName])
+  const saveHabitModal = useCallback(() => {
+    const name = draft.name.trim()
+    const modal = habitModal
+    if (!name || !modal) return
+    const category = draft.category.trim() || 'Other'
+    const color = isHexColor(draft.color) ? draft.color : COLOR_PRESETS[0]
+    const icon = (EMOJI_ICONS as readonly string[]).includes(draft.icon)
+      ? draft.icon
+      : EMOJI_ICONS[0]
+
+    setData((s) => {
+      const preset = new Set(PRESET_CATEGORIES as readonly string[])
+      let nextCustom = s.customCategories
+      if (!preset.has(category) && !nextCustom.includes(category)) {
+        nextCustom = [...nextCustom, category].sort((a, b) =>
+          a.localeCompare(b),
+        )
+      }
+
+      if (modal.mode === 'add') {
+        return {
+          ...s,
+          customCategories: nextCustom,
+          habits: [
+            ...s.habits,
+            { id: crypto.randomUUID(), name, category, color, icon },
+          ],
+        }
+      }
+      const id = modal.id
+      return {
+        ...s,
+        customCategories: nextCustom,
+        habits: s.habits.map((h) =>
+          h.id === id ? { ...h, name, category, color, icon } : h,
+        ),
+      }
+    })
+    setHabitModal(null)
+  }, [draft, habitModal])
+
+  const addCustomCategoryFromInput = useCallback(() => {
+    const label = newCategoryInput.trim()
+    if (!label) return
+    const preset = PRESET_CATEGORIES as readonly string[]
+    const matchPreset = preset.find(
+      (p) => p.toLowerCase() === label.toLowerCase(),
+    )
+    if (matchPreset) {
+      setDraft((d) => ({ ...d, category: matchPreset }))
+      setNewCategoryInput('')
+      return
+    }
+    setData((s) => {
+      if (
+        s.customCategories.some((c) => c.toLowerCase() === label.toLowerCase())
+      ) {
+        return s
+      }
+      return {
+        ...s,
+        customCategories: [...s.customCategories, label].sort((a, b) =>
+          a.localeCompare(b),
+        ),
+      }
+    })
+    setDraft((d) => ({ ...d, category: label }))
+    setNewCategoryInput('')
+  }, [newCategoryInput])
 
   const deleteHabit = useCallback((id: string, name: string) => {
     const ok = window.confirm(`Remove habit "${name}"? This cannot be undone.`)
@@ -466,9 +725,27 @@ export default function App() {
         completions: nextCompletions,
         bestStreakByHabitId: nextBest,
         milestoneSeen: nextSeen,
+        customCategories: s.customCategories,
       }
     })
   }, [])
+
+  const categorySelectOptions = useMemo(() => {
+    const s = new Set<string>(categoryOptions)
+    const d = draft.category.trim()
+    if (d) s.add(d)
+    const arr = [...s]
+    const preset = PRESET_CATEGORIES as readonly string[]
+    arr.sort((a, b) => {
+      const ap = preset.indexOf(a)
+      const bp = preset.indexOf(b)
+      if (ap !== -1 && bp !== -1) return ap - bp
+      if (ap !== -1) return -1
+      if (bp !== -1) return 1
+      return a.localeCompare(b)
+    })
+    return arr
+  }, [categoryOptions, draft.category])
 
   const dateLabel = now.toLocaleDateString(undefined, {
     weekday: 'long',
@@ -606,8 +883,14 @@ export default function App() {
                             key={`stat-${h.id}`}
                             className="flex items-baseline justify-between gap-2 border-b border-zinc-800/50 pb-2 last:border-0 last:pb-0"
                           >
-                            <span className="min-w-0 truncate text-zinc-300">
-                              {h.name}
+                            <span className="flex min-w-0 items-center gap-2 text-zinc-300">
+                              <span
+                                className="shrink-0 text-base leading-none"
+                                aria-hidden
+                              >
+                                {h.icon}
+                              </span>
+                              <span className="truncate">{h.name}</span>
                             </span>
                             <span className="shrink-0 tabular-nums text-zinc-400">
                               <span className="text-zinc-200">{r.week.pct}%</span>
@@ -638,110 +921,291 @@ export default function App() {
           </div>
         )}
 
-        <ul className="flex flex-1 flex-col gap-3">
-          {habits.map((habit) => {
-            const done = isCompleted(completions, habit.id, today)
-            const streak = habitStreak(completions, habit.id)
-            const best = bestStreakByHabitId[habit.id] ?? 0
-            const showStreakRow = streak > 0 || best > 0
-            const hr = habitRates[habit.id]
-            return (
-              <li
-                key={habit.id}
-                title={formatRateTooltip(hr.week, hr.month)}
-                className="group flex items-stretch gap-3 rounded-2xl border border-zinc-800/90 bg-zinc-900/50 p-3 shadow-sm transition-colors hover:border-zinc-700/90"
-              >
-                <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-3">
-                  <span className="relative flex h-11 w-11 shrink-0 items-center justify-center">
-                    <input
-                      type="checkbox"
-                      checked={done}
-                      onChange={() => toggle(habit.id)}
-                      className="peer absolute h-full w-full cursor-pointer opacity-0"
-                    />
-                    <span
-                      className={[
-                        'flex h-10 w-10 items-center justify-center rounded-xl border-2 transition-all duration-300 ease-out',
-                        done
-                          ? 'scale-100 border-emerald-400 bg-emerald-500/20 shadow-[0_0_0_4px_rgba(16,185,129,0.15)]'
-                          : 'border-zinc-600 bg-zinc-800/80 peer-hover:border-zinc-500 peer-active:scale-95',
-                      ].join(' ')}
-                      aria-hidden
-                    >
-                      <svg
-                        viewBox="0 0 24 24"
-                        className={[
-                          'h-5 w-5 transition-all duration-300 ease-out',
-                          done
-                            ? 'scale-100 opacity-100 text-emerald-300'
-                            : 'scale-50 opacity-0',
-                        ].join(' ')}
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2.5"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
+        <div className="flex flex-1 flex-col gap-6">
+          {habits.length === 0 ? (
+            <p className="text-center text-sm text-zinc-500">
+              No habits yet. Tap &quot;Add habit&quot; below.
+            </p>
+          ) : (
+            habitsByCategory.map(({ category, habits: catHabits }) => (
+              <section key={category}>
+                <h2 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-zinc-500">
+                  <span className="h-px min-w-[1rem] flex-1 bg-zinc-800" aria-hidden />
+                  <span className="shrink-0">{category}</span>
+                  <span className="h-px min-w-[1rem] flex-1 bg-zinc-800" aria-hidden />
+                </h2>
+                <ul className="flex flex-col gap-3">
+                  {catHabits.map((habit) => {
+                    const done = isCompleted(completions, habit.id, today)
+                    const streak = habitStreak(completions, habit.id)
+                    const best = bestStreakByHabitId[habit.id] ?? 0
+                    const showStreakRow = streak > 0 || best > 0
+                    const hr = habitRates[habit.id]
+                    return (
+                      <li
+                        key={habit.id}
+                        title={formatRateTooltip(hr.week, hr.month)}
+                        style={{ borderLeft: `3px solid ${habit.color}` }}
+                        className="group flex items-stretch gap-2 rounded-2xl border border-y border-r border-zinc-800/90 bg-zinc-900/50 py-2 pl-2 pr-2 shadow-sm transition-colors hover:border-zinc-700/90"
                       >
-                        <path d="M5 13l4 4L19 7" />
-                      </svg>
-                    </span>
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <span
-                      className={[
-                        'block truncate text-base font-medium transition-colors duration-200',
-                        done ? 'text-zinc-400 line-through decoration-zinc-600' : 'text-zinc-100',
-                      ].join(' ')}
-                    >
-                      {habit.name}
-                    </span>
-                    {showStreakRow && (
-                      <span className="mt-0.5 block text-xs text-amber-400/95">
-                        🔥 {streak}
-                        {best > 0 ? (
-                          <span className="text-zinc-500"> (best: {best})</span>
-                        ) : null}
+                      <span
+                        className="flex w-9 shrink-0 select-none items-center justify-center text-xl leading-none"
+                        aria-hidden
+                      >
+                        {habit.icon}
                       </span>
-                    )}
-                  </span>
-                </label>
-                <button
-                  type="button"
-                  onClick={() => deleteHabit(habit.id, habit.name)}
-                  className="shrink-0 self-center rounded-lg px-2 py-2 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
-                  aria-label={`Delete ${habit.name}`}
-                >
-                  Delete
-                </button>
-              </li>
-            )
-          })}
-        </ul>
+                      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+                        <span className="relative flex h-11 w-11 shrink-0 items-center justify-center">
+                          <input
+                            type="checkbox"
+                            checked={done}
+                            onChange={() => toggle(habit.id)}
+                            className="peer absolute h-full w-full cursor-pointer opacity-0"
+                          />
+                          <span
+                            className={[
+                              'flex h-10 w-10 items-center justify-center rounded-xl border-2 transition-all duration-300 ease-out',
+                              done
+                                ? 'scale-100 shadow-[0_0_0_4px_rgba(255,255,255,0.06)]'
+                                : 'border-zinc-600 bg-zinc-800/80 peer-hover:border-zinc-500 peer-active:scale-95',
+                            ].join(' ')}
+                            style={
+                              done
+                                ? {
+                                    borderColor: habit.color,
+                                    backgroundColor: `${habit.color}22`,
+                                  }
+                                : undefined
+                            }
+                            aria-hidden
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              className={[
+                                'h-5 w-5 transition-all duration-300 ease-out',
+                                done
+                                  ? 'scale-100 opacity-100'
+                                  : 'scale-50 opacity-0',
+                              ].join(' ')}
+                              style={done ? { color: habit.color } : undefined}
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="2.5"
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            >
+                              <path d="M5 13l4 4L19 7" />
+                            </svg>
+                          </span>
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span
+                            className={[
+                              'block truncate text-base font-medium transition-colors duration-200',
+                              done
+                                ? 'text-zinc-400 line-through decoration-zinc-600'
+                                : 'text-zinc-100',
+                            ].join(' ')}
+                          >
+                            {habit.name}
+                          </span>
+                          {showStreakRow && (
+                            <span className="mt-0.5 block text-xs text-amber-400/95">
+                              🔥 {streak}
+                              {best > 0 ? (
+                                <span className="text-zinc-500">
+                                  {' '}
+                                  (best: {best})
+                                </span>
+                              ) : null}
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                      <div className="flex shrink-0 flex-col justify-center gap-0.5 self-stretch sm:flex-row sm:items-center">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setHabitModal({ mode: 'edit', id: habit.id })
+                          }
+                          className="rounded-lg px-2 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => deleteHabit(habit.id, habit.name)}
+                          className="rounded-lg px-2 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
+                          aria-label={`Delete ${habit.name}`}
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+            ))
+          )}
+        </div>
 
         <section className="mt-8 border-t border-zinc-800/80 pt-6">
-          <h2 className="mb-3 text-sm font-medium uppercase tracking-wider text-zinc-500">
+          <button
+            type="button"
+            onClick={() => setHabitModal({ mode: 'add' })}
+            className="min-h-11 w-full rounded-xl border border-zinc-600 bg-zinc-900 px-5 py-3 text-sm font-medium text-zinc-200 transition-colors hover:border-zinc-500 hover:bg-zinc-800"
+          >
             Add habit
-          </h2>
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <input
-              type="text"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') addHabit()
-              }}
-              placeholder="New habit name"
-              className="min-h-11 flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-4 text-zinc-100 placeholder:text-zinc-600 outline-none ring-emerald-500/40 transition-shadow focus:border-emerald-600/70 focus:ring-2"
-            />
-            <button
-              type="button"
-              onClick={addHabit}
-              className="min-h-11 shrink-0 rounded-xl bg-zinc-100 px-5 font-medium text-zinc-900 transition-transform active:scale-[0.98] hover:bg-white"
-            >
-              Add
-            </button>
-          </div>
+          </button>
         </section>
+
+        {habitModal && (
+          <div
+            className="fixed inset-0 z-[60] flex items-end justify-center bg-black/65 p-4 sm:items-center"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="habit-modal-title"
+            onClick={() => setHabitModal(null)}
+          >
+            <div
+              className="max-h-[min(90vh,540px)] w-full max-w-lg overflow-y-auto rounded-2xl border border-zinc-700 bg-zinc-950 p-5 shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h2
+                id="habit-modal-title"
+                className="text-lg font-semibold text-white"
+              >
+                {habitModal.mode === 'add' ? 'New habit' : 'Edit habit'}
+              </h2>
+              <div className="mt-4 flex flex-col gap-4">
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Name
+                  </span>
+                  <input
+                    type="text"
+                    value={draft.name}
+                    onChange={(e) =>
+                      setDraft((d) => ({ ...d, name: e.target.value }))
+                    }
+                    placeholder="Habit name"
+                    className="min-h-11 w-full rounded-xl border border-zinc-700 bg-zinc-900 px-4 text-zinc-100 placeholder:text-zinc-600 outline-none ring-emerald-500/30 focus:border-emerald-600/70 focus:ring-2"
+                  />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Category
+                  </span>
+                  <select
+                    value={
+                      categorySelectOptions.includes(draft.category)
+                        ? draft.category
+                        : categorySelectOptions[0] ?? 'Other'
+                    }
+                    onChange={(e) =>
+                      setDraft((d) => ({ ...d, category: e.target.value }))
+                    }
+                    className="min-h-11 w-full rounded-xl border border-zinc-700 bg-zinc-900 px-4 text-zinc-100 outline-none focus:border-emerald-600/70 focus:ring-2 focus:ring-emerald-500/30"
+                  >
+                    {categorySelectOptions.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div>
+                  <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Custom category
+                  </span>
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <input
+                      type="text"
+                      value={newCategoryInput}
+                      onChange={(e) => setNewCategoryInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault()
+                          addCustomCategoryFromInput()
+                        }
+                      }}
+                      placeholder="New category name"
+                      className="min-h-11 flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-4 text-zinc-100 placeholder:text-zinc-600 outline-none focus:border-emerald-600/70 focus:ring-2 focus:ring-emerald-500/30"
+                    />
+                    <button
+                      type="button"
+                      onClick={addCustomCategoryFromInput}
+                      className="min-h-11 shrink-0 rounded-xl border border-zinc-600 bg-zinc-800 px-4 text-sm font-medium text-zinc-200 hover:bg-zinc-700"
+                    >
+                      Add
+                    </button>
+                  </div>
+                </div>
+                <div>
+                  <span className="mb-2 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Color
+                  </span>
+                  <div className="flex flex-wrap gap-2">
+                    {COLOR_PRESETS.map((c) => (
+                      <button
+                        key={c}
+                        type="button"
+                        title={c}
+                        onClick={() => setDraft((d) => ({ ...d, color: c }))}
+                        className={[
+                          'h-9 w-9 rounded-full border-2 transition-transform hover:scale-105',
+                          draft.color === c
+                            ? 'border-white ring-2 ring-white/30'
+                            : 'border-transparent',
+                        ].join(' ')}
+                        style={{ backgroundColor: c }}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <span className="mb-2 block text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Icon
+                  </span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {EMOJI_ICONS.map((ic) => (
+                      <button
+                        key={ic}
+                        type="button"
+                        onClick={() => setDraft((d) => ({ ...d, icon: ic }))}
+                        className={[
+                          'flex h-10 w-10 items-center justify-center rounded-lg border text-lg transition-colors',
+                          draft.icon === ic
+                            ? 'border-emerald-500/80 bg-emerald-950/50'
+                            : 'border-zinc-800 bg-zinc-900 hover:border-zinc-600',
+                        ].join(' ')}
+                      >
+                        {ic}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+                <button
+                  type="button"
+                  onClick={() => setHabitModal(null)}
+                  className="min-h-11 rounded-xl border border-zinc-600 px-4 text-sm font-medium text-zinc-300 hover:bg-zinc-900"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={saveHabitModal}
+                  className="min-h-11 rounded-xl bg-zinc-100 px-5 text-sm font-medium text-zinc-900 hover:bg-white"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )
